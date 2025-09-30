@@ -54,7 +54,7 @@ enum AlarmState {
 volatile AlarmState alarmState = IDLE;
 
 
-volatile bool isArmed = false;
+volatile bool isArmed = true;
 volatile bool buzzerOn = false;
 volatile unsigned long buzzerStartTime = 0;
 const unsigned long buzzerDuration = 20000;
@@ -81,11 +81,6 @@ portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
 portMUX_TYPE servoMux = portMUX_INITIALIZER_UNLOCKED;
 // -------------------------.
 
-// LEDC channels for RGB only
-// -------------------------
-const int R_CH = 1;
-const int G_CH = 2;
-const int B_CH = 3;
 
 // RGB PWM properties
 const int RGB_FREQ = 1000;  // 1kHz for LEDs
@@ -95,7 +90,7 @@ const int RGB_RES = 8;      // 8-bit resolution
 // Servo timer
 // -------------------------
 hw_timer_t* servoTimer = NULL;
-volatile int servoPulseUs = 1000;  // default pulse (us)
+volatile uint32_t servoPulseUs = 1000;  // default pulse (us)
 // Servo state machine
 enum ServoState { SERVO_LOW,
                   SERVO_HIGH };
@@ -141,7 +136,7 @@ inline void logMessage(const char* msg);
 
 void setup() {
   Serial.begin(115200);
-  delay(50);
+  Serial.println("Starting!");
 
   // pins
   pinMode(TRIG_PIN, OUTPUT);
@@ -151,20 +146,24 @@ void setup() {
   pinMode(MOTION_PIN, INPUT);
   pinMode(LDR_DO_PIN, INPUT);
 
+  ledcSetClockSource(LEDC_USE_APB_CLK);
   // Setup RGB channels
-  ledcAttach(R_CH, RGB_FREQ, RGB_RES);
-  ledcAttach(G_CH, RGB_FREQ, RGB_RES);
-  ledcAttach(B_CH, RGB_FREQ, RGB_RES);
-
+  ledcAttach(R_PIN, RGB_FREQ, RGB_RES);
+  ledcAttach(G_PIN, RGB_FREQ, RGB_RES);
+  ledcAttach(B_PIN, RGB_FREQ, RGB_RES);
+  Serial.println("pin Setup Done!");
   // default white
   setRGB(255, 255, 255);
 
-
   servoTimer = timerBegin(1000000);
-  if (servoTimer == nullptr) {
+  if (servoTimer == NULL) {
     Serial.println("Failed to Start Timer!!");
-    ESP.restart();
+    while (1) {
+      delay(1000);
+    }
   }
+  analogSetPinAttenuation(SMOKE_AO_PIN, ADC_11db);
+  analogReadResolution(12);
   // Attach update (overflow) interrupt
   timerAttachInterrupt(servoTimer, &onServoTimerAlarmISR);
 
@@ -176,14 +175,14 @@ void setup() {
   // 10 messages, each up to 64 chars
 
   logMessage("🚀 سیستم راه‌اندازی شد (FreeRTOS tasks)");
-
+  delay(5000);
   // Core 0: timing-critical
   xTaskCreatePinnedToCore(TaskUltrasonic, "TaskUltrasonic", 3072, NULL, 2, &TaskUltrasonicHandle, 0);
-  xTaskCreatePinnedToCore(TaskMotion, "TaskMotion", 2048, NULL, 2, &TaskMotionHandle, 0);
+  xTaskCreatePinnedToCore(TaskMotion, "TaskMotion", 2048, NULL, 1, &TaskMotionHandle, 0);
 
   // Core 1: background / non-critical
-  xTaskCreatePinnedToCore(TaskSensors, "TaskSensors", 4096, NULL, 2, &TaskSensorsHandle, 1);
-  xTaskCreatePinnedToCore(TaskRGB, "TaskRGB", 2048, NULL, 1, &TaskRGBHandle, 1);
+  xTaskCreatePinnedToCore(TaskSensors, "TaskSensors", 4096, NULL, 3, &TaskSensorsHandle, 1);
+  xTaskCreatePinnedToCore(TaskRGB, "TaskRGB", 2048, NULL, 2, &TaskRGBHandle, 1);
   xTaskCreatePinnedToCore(TaskDebug, "TaskDebug", 4096, NULL, 1, NULL, 1);
 
   timerStart(servoTimer);
@@ -212,12 +211,12 @@ void TaskUltrasonic(void* pvParameters) {
     delayMicroseconds(10);
     digitalWrite(TRIG_PIN, LOW);
 
-    long duration = pulseIn(ECHO_PIN, HIGH, 20000);
+    long duration = pulseIn(ECHO_PIN, HIGH, 10000);
     if (duration > 0) {
       float distance = duration * ULTRASONIC_WIDTH_2_DISTANCE_COEFFICIENT;
 
       char buf[256];
-      sprintf(buf, "📏 فاصله: %f.1 cm", distance);
+      sprintf(buf, "📏 فاصله: %.1f cm", distance);
       logMessage(buf);
 
       taskENTER_CRITICAL(&timerMux);
@@ -245,11 +244,14 @@ void TaskUltrasonic(void* pvParameters) {
         logMessage("ماشین در پارکینگ نیست");
       }
       taskEXIT_CRITICAL(&timerMux);
+    } else {
+      logMessage("ماشینی در نزدیکی نیست!");
+      setServoAngle(0);
     }
 
     // Wait until next cycle
     vTaskDelayUntil(&lastWakeTime, pdMS_TO_TICKS(ultrasonicInterval));
-  }a
+  }
 }
 
 
@@ -278,7 +280,7 @@ void TaskSensors(void* pvParameters) {
     sprintf(buf, "🌫️ دود: %d", smokeVal);
     logMessage(buf);
 
-    if (smokeVal > 300) {
+    if (smokeVal > 500) {
       logMessage("⚠️ دود زیاد!");
       if (alarmState != FLAME) {
         alarmState = SMOKE_HIGH;
@@ -291,7 +293,7 @@ void TaskSensors(void* pvParameters) {
     float temp = dht.readTemperature();
     float hum = dht.readHumidity();
     if (!isnan(temp) && !isnan(hum)) {
-      sprintf(buf, "🌡️ دما: 1.&f °C | 💧 رطوبت: 1.%f %%", temp, hum);
+      sprintf(buf, "🌡️ دما: %.1f °C | 💧 رطوبت: %.1f %%", temp, hum);
       logMessage(buf);
     } else {
       logMessage("⚠️ خطا در خواندن DHT");
@@ -318,9 +320,10 @@ void TaskMotion(void* pvParameters) {
   while (1) {
     unsigned long now = millis();
     bool motionDetected = (digitalRead(MOTION_PIN) == HIGH);
-
+    static unsigned long lastMotionDetection = 0;
     // Home security motion has the lowest priority
     if (motionDetected) {
+      lastMotionDetection = now;
       if (isArmed) {
         if (alarmState != FLAME && alarmState != SMOKE_HIGH) {
           alarmState = MOTION;
@@ -329,7 +332,7 @@ void TaskMotion(void* pvParameters) {
       } else {
         logMessage("👣 حرکت تشخیص داده شد (دزدگیر خاموش)");
       }
-    } else if (alarmState == MOTION) {
+    } else if (now - lastMotionDetection > 5000) {
       alarmState = IDLE;
     }
 
@@ -355,8 +358,10 @@ void TaskRGB(void* pvParameters) {
       case MOTION:
         {
           if (motionLED == RED) {
+            motionLED=BLUE;
             setRGB(0, 0, 255);
           } else {
+            motionLED=RED;
             setRGB(255, 0, 0);
           }
         }
@@ -373,11 +378,10 @@ void TaskRGB(void* pvParameters) {
 }
 
 void TaskDebug(void* pvParameters) {
-  char msg[64];
-
   while (1) {
     // Wait indefinitely until a message arrives
-    if (xQueueReceive(debugQueue, &msg, portMAX_DELAY) == pdPASS) {
+    char msg[256];
+    if (xQueueReceive(debugQueue, msg, portMAX_DELAY) == pdPASS) {
       Serial.println(msg);
     }
   }
@@ -388,21 +392,23 @@ void TaskDebug(void* pvParameters) {
 // -------------------------
 void setServoAngle(int angle) {
   // Clamp to safe range
-  angle = constrain(angle, 0, 180);
+  angle = constrain(angle, 0, 90);
 
-  // Map angle (0–180) to pulse (1000–2000 µs)
-  int pulse = map(angle, 0, 180, 1000, 2000);
+  // Map angle (0-90) to pulse (1000–2000 µs)
+  int pulse = map(angle, 0, 90, 1000, 2000);
 
   // Update global pulse width
   servoPulseUs = pulse;
 }
 void logMessage(const char* msg) {
-  // Non-blocking send to queue
-  xQueueSend(debugQueue, msg, 0);
+  char buf[256];
+  strncpy(buf, msg, sizeof(buf));
+  buf[sizeof(buf) - 1] = '\0';
+  xQueueSend(debugQueue, buf, 0);
 }
 void setRGB(uint8_t r, uint8_t g, uint8_t b) {
-  ledcWrite(R_CH, r);
-  ledcWrite(G_CH, g);
-  ledcWrite(B_CH, b);
+  ledcWrite(R_PIN, r);
+  ledcWrite(G_PIN, g);
+  ledcWrite(B_PIN, b);
 }
 // -------------------------.
