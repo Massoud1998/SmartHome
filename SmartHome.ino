@@ -1,13 +1,17 @@
+#include <Arduino.h>
 #include <DHT.h>
 
-#define B 5
-#define R 18
-#define G 19
+// -------------------------
+// Pins & configuration
+// -------------------------
+#define B_PIN 5
+#define R_PIN 18
+#define G_PIN 19
 
 #define DHT_TYPE DHT22
 #define DHT_PIN 12
 
-#define FAN 15
+#define FAN_PIN 15
 #define SERVO_PIN 13
 #define TRIG_PIN 27
 #define ECHO_PIN 26
@@ -16,219 +20,389 @@
 #define SMOKE_AO_PIN 32
 #define IR_FLAME_PIN 35
 
+#define ULTRASONIC_WIDTH_2_DISTANCE_COEFFICIENT (0.0343f / 2.0f)
+
 DHT dht(DHT_PIN, DHT_TYPE);
-// --- متغیرها ---
-bool doorOpened = false;
-unsigned long lastDoorActionTime = 0;
 
-bool alarmTouchLastState = false;
-unsigned long lastAlarmTouchTime = 0;
-const unsigned long alarmTouchDebounce = 250;
+// -------------------------
+// Hysteresis / timing
+// -------------------------
+const float openDistanceMin = 5.0f;
+const float openDistanceMax = 10.0f;
+const float closeDistanceFar = 20.0f;
+const float closeDistanceNear = 3.0f;
 
-bool ledTouchLastState = false;
-unsigned long lastLedTouchTime = 0;
-const unsigned long ledTouchDebounce = 250;
-
-bool isArmed = false;
-bool buzzerOn = false;
-unsigned long buzzerStartTime = 0;
-const unsigned long buzzerDuration = 20000;  // ۲۰ ثانیه
-
-bool touchLedState = false;
-
-bool motionLedOn = false;
-unsigned long motionLedStartTime = 0;
-
-unsigned long lastUltrasonicRead = 0;
 const unsigned long ultrasonicInterval = 2000;
+const unsigned long sensorInterval = 5000;
+const unsigned long motionInterval = 1000;
+// -------------------------
+// Shared state (protected by simple critical sections)
+// -------------------------
+enum DoorState { CLOSED,
+                 OPEN };
+volatile DoorState doorState = CLOSED;
+volatile unsigned long autoCloseDelay = 3000;
 
-unsigned long lastSensorCheck = 0;
 
-// مقادیر هیسترزیس برای پارکینگ
-const float openDistanceMin = 5;
-const float openDistanceMax = 10;
-const float closeDistance = 20;
+enum AlarmState {
+  IDLE,       // No alarm triggered
+  MOTION,     // Motion detected
+  FLAME,      // Flame detected
+  SMOKE_HIGH  // High smoke density detected
+};
+
+volatile AlarmState alarmState = IDLE;
+
+
+volatile bool isArmed = false;
+volatile bool buzzerOn = false;
+volatile unsigned long buzzerStartTime = 0;
+const unsigned long buzzerDuration = 20000;
+
+volatile bool motionLedOn = false;
+volatile unsigned long motionLedStartTime = 0;
+
+// -------------------------
+// FreeRTOS task handles
+// -------------------------
+TaskHandle_t TaskUltrasonicHandle = NULL;
+TaskHandle_t TaskSensorsHandle = NULL;
+TaskHandle_t TaskMotionHandle = NULL;
+TaskHandle_t TaskRGBHandle = NULL;
+// -------------------------
+// FreeRTOS Queue handles
+// -------------------------
+QueueHandle_t debugQueue;
+// -------------------------.
+// -------------------------
+// FreeRTOS Mutex handles
+// -------------------------
+portMUX_TYPE timerMux = portMUX_INITIALIZER_UNLOCKED;
+portMUX_TYPE servoMux = portMUX_INITIALIZER_UNLOCKED;
+// -------------------------.
+
+// LEDC channels for RGB only
+// -------------------------
+const int R_CH = 1;
+const int G_CH = 2;
+const int B_CH = 3;
+
+// RGB PWM properties
+const int RGB_FREQ = 1000;  // 1kHz for LEDs
+const int RGB_RES = 8;      // 8-bit resolution
+
+// -------------------------
+// Servo timer
+// -------------------------
+hw_timer_t* servoTimer = NULL;
+volatile int servoPulseUs = 1000;  // default pulse (us)
+// Servo state machine
+enum ServoState { SERVO_LOW,
+                  SERVO_HIGH };
+volatile ServoState servoState = SERVO_LOW;
+
+void IRAM_ATTR onServoTimerAlarmISR() {
+  portENTER_CRITICAL_ISR(&servoMux);
+
+  if (servoState == SERVO_LOW) {
+    timerRestart(servoTimer);
+    // Start pulse
+    digitalWrite(SERVO_PIN, HIGH);
+    servoState = SERVO_HIGH;
+    // Set next alarm for pulse width duration
+    timerAlarm(servoTimer, servoPulseUs, false, 0);  // pulse width
+  } else {
+    // End pulse
+    digitalWrite(SERVO_PIN, LOW);
+    servoState = SERVO_LOW;
+    // Set next alarm for remainder of 20 ms period
+    timerAlarm(servoTimer, 20000, false, 0);  // remainder
+  }
+
+  portEXIT_CRITICAL_ISR(&servoMux);
+}
+
+
+// -------------------------
+// Prototypes
+// -------------------------
+void TaskUltrasonic(void* pvParameters);
+void TaskSensors(void* pvParameters);
+void TaskMotion(void* pvParameters);
+void TaskRGB(void* pvParameters);
+void TaskDebug(void* pvParameters);
+
+void setServoAngle(int angle);
+// simple helper to set RGB (0-255 each)
+inline void setRGB(uint8_t r, uint8_t g, uint8_t b);
+
+// helper function to add msgs to the queue
+inline void logMessage(const char* msg);
 
 void setup() {
   Serial.begin(115200);
-  pinMode(R, OUTPUT);
-  pinMode(G, OUTPUT);
-  pinMode(B, OUTPUT);
+  delay(50);
+
+  // pins
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
-  pinMode(SERVO_PIN,OUTPUT);
+  pinMode(SERVO_PIN, OUTPUT);
   pinMode(IR_FLAME_PIN, INPUT);
-
-  // pinMode(ALARM_TOUCH_PIN, INPUT);
-  // pinMode(LED_TOUCH_PIN, INPUT);
-  // pinMode(TOUCH_LED_PIN, OUTPUT);
-  // digitalWrite(TOUCH_LED_PIN, LOW);
-
-  // pinMode(BUZZER_PIN, OUTPUT);
-  // digitalWrite(BUZZER_PIN, LOW);
-
   pinMode(MOTION_PIN, INPUT);
-
   pinMode(LDR_DO_PIN, INPUT);
 
-  // digitalWrite(LDR_LED_PIN, LOW);
-  if(ledcSetClockSource(LEDC_USE_APB_CLK))
-  Serial.println("CLOCK SOURCE SET");
-  ledcAttach(SERVO_PIN, 20, 20); 
-  ledcWrite(SERVO_PIN,10);
+  // Setup RGB channels
+  ledcAttach(R_CH, RGB_FREQ, RGB_RES);
+  ledcAttach(G_CH, RGB_FREQ, RGB_RES);
+  ledcAttach(B_CH, RGB_FREQ, RGB_RES);
+
+  // default white
+  setRGB(255, 255, 255);
+
+
+  servoTimer = timerBegin(1000000);
+  if (servoTimer == nullptr) {
+    Serial.println("Failed to Start Timer!!");
+    ESP.restart();
+  }
+  // Attach update (overflow) interrupt
+  timerAttachInterrupt(servoTimer, &onServoTimerAlarmISR);
+
+  timerAlarm(servoTimer, servoPulseUs, false, 0);
+
   dht.begin();
 
-  Serial.println("🚀 سیستم راه‌اندازی شد");
-  analogWrite(R, 255);
-  analogWrite(G, 255);
-  analogWrite(B, 255);
+  debugQueue = xQueueCreate(20, sizeof(char) * 256);
+  // 10 messages, each up to 64 chars
+
+  logMessage("🚀 سیستم راه‌اندازی شد (FreeRTOS tasks)");
+
+  // Core 0: timing-critical
+  xTaskCreatePinnedToCore(TaskUltrasonic, "TaskUltrasonic", 3072, NULL, 2, &TaskUltrasonicHandle, 0);
+  xTaskCreatePinnedToCore(TaskMotion, "TaskMotion", 2048, NULL, 2, &TaskMotionHandle, 0);
+
+  // Core 1: background / non-critical
+  xTaskCreatePinnedToCore(TaskSensors, "TaskSensors", 4096, NULL, 2, &TaskSensorsHandle, 1);
+  xTaskCreatePinnedToCore(TaskRGB, "TaskRGB", 2048, NULL, 1, &TaskRGBHandle, 1);
+  xTaskCreatePinnedToCore(TaskDebug, "TaskDebug", 4096, NULL, 1, NULL, 1);
+
+  timerStart(servoTimer);
 }
 
 void loop() {
-  unsigned long now = millis();
-  // --- تاچ برای فعال/غیرفعال کردن دزدگیر ---
-  // bool currentAlarmTouch = (digitalRead(ALARM_TOUCH_PIN) == LOW);
-  // if (currentAlarmTouch && !alarmTouchLastState && (now - lastAlarmTouchTime > alarmTouchDebounce)) {
-  //   isArmed = !isArmed;
-  //   Serial.println(isArmed ? "🔒 دزدگیر فعال شد" : "🔓 دزدگیر غیرفعال شد");
+  vTaskDelay(portMAX_DELAY);
+}
 
-  // if (!isArmed) {
-  //   digitalWrite(BUZZER_PIN, LOW);
-  //   buzzerOn = false;
-  // }
-  // lastAlarmTouchTime = now;
-  // }
-  // alarmTouchLastState = currentAlarmTouch;
+// -------------------------
+// Tasks
+// -------------------------
 
-  // --- تاچ برای کنترل LED ---
-  // bool currentLedTouch = (digitalRead(LED_TOUCH_PIN) == LOW);
-  // if (currentLedTouch && !ledTouchLastState && (now - lastLedTouchTime > ledTouchDebounce)) {
-  //   touchLedState = !touchLedState;
-  //   digitalWrite(TOUCH_LED_PIN, touchLedState ? HIGH : LOW);
-  //   Serial.println(touchLedState ? "💡 LED روشن شد" : "💡 LED خاموش شد");
-  //   lastLedTouchTime = now;
-  // }
-  // ledTouchLastState = currentLedTouch;
+// Ultrasonic task: measure distance every ultrasonicInterval and control servo/door
+void TaskUltrasonic(void* pvParameters) {
+  (void)pvParameters;
 
-  // --- دزدگیر و موشن ---
-  if (isArmed && digitalRead(MOTION_PIN) == HIGH) {
-    if (!buzzerOn) {
-      // digitalWrite(BUZZER_PIN, HIGH);
-      // buzzerOn = true;
-      // buzzerStartTime = now;
-      Serial.println("🚨 حرکت تشخیص داده شد → بازر فعال شد");
-    }
-  }
-
-  // --- موشن وقتی دزدگیر خاموش است ---
-  // if (!isArmed && digitalRead(MOTION_PIN) == HIGH && !motionLedOn) {
-  //   digitalWrite(TOUCH_LED_PIN, HIGH);
-  //   motionLedOn = true;
-  //   motionLedStartTime = now;
-  //   Serial.println("👣 حرکت تشخیص داده شد (دزدگیر خاموش) → LED روشن شد");
-  // }
-
-  // --- خاموشی خودکار LED موشن ---
-  if (motionLedOn && (now - motionLedStartTime >= 20000)) {
-    // digitalWrite(TOUCH_LED_PIN, LOW);
-    motionLedOn = false;
-    Serial.println("💡 LED موشن خاموش شد");
-  }
-
-  // --- اولتراسونیک ---
-  if (now - lastUltrasonicRead >= ultrasonicInterval) {
-    lastUltrasonicRead = now;
-
+  TickType_t lastWakeTime = xTaskGetTickCount();
+  static unsigned long doorOpenTime = 0;
+  while (1) {
+    unsigned long now = millis();
+    // Trigger ultrasonic pulse
     digitalWrite(TRIG_PIN, LOW);
     delayMicroseconds(2);
     digitalWrite(TRIG_PIN, HIGH);
     delayMicroseconds(10);
     digitalWrite(TRIG_PIN, LOW);
 
-    long duration = pulseIn(ECHO_PIN, HIGH, 20000);  // کاهش تایم‌آوت
+    long duration = pulseIn(ECHO_PIN, HIGH, 20000);
     if (duration > 0) {
-      float distance = duration * 0.0343 / 2;
-      Serial.print("📏 فاصله: ");
-      Serial.print(distance);
-      Serial.println(" cm");
+      float distance = duration * ULTRASONIC_WIDTH_2_DISTANCE_COEFFICIENT;
 
-      if (distance > closeDistance) {
-        ledcWrite(SERVO_PIN,10);
-        doorOpened = false;
-        Serial.println("🚗 ماشین در پارکینگ نیست");
-      } else if (distance >= openDistanceMin && distance <= openDistanceMax && !doorOpened) {
-        ledcWrite(SERVO_PIN,200);
-        doorOpened = true;
-        lastDoorActionTime = now;
-        Serial.println("🔓 باز کردن درب...");
-      } else if (distance < openDistanceMin) {
-        Serial.println("✅ ماشین در پارکینگ هست");
-      }
+      char buf[256];
+      sprintf(buf, "📏 فاصله: %f.1 cm", distance);
+      logMessage(buf);
 
-      if (doorOpened && now - lastDoorActionTime > 3000) {
-        ledcWrite(SERVO_PIN,10);
-        Serial.println("🔒 درب بسته شد");
-        doorOpened = false;
+      taskENTER_CRITICAL(&timerMux);
+      switch (doorState) {
+        case CLOSED:
+          if (distance >= openDistanceMin && distance <= openDistanceMax) {
+            doorState = OPEN;
+            doorOpenTime = now;
+            setServoAngle(90);  // open
+            logMessage("🔓 باز کردن درب...");
+          }
+          break;
+
+        case OPEN:
+          if ((distance > closeDistanceFar) || (now - doorOpenTime >= autoCloseDelay) || (distance < closeDistanceNear)) {
+            doorState = CLOSED;
+            setServoAngle(0);  // close
+            logMessage("🔒 درب بسته شد");
+          }
+          break;
       }
+      if (distance < closeDistanceNear) {
+        logMessage("ماشین در پارکینگ است");
+      } else {
+        logMessage("ماشین در پارکینگ نیست");
+      }
+      taskEXIT_CRITICAL(&timerMux);
     }
-  }
 
-  // --- خاموشی خودکار بازر ---
-  if (buzzerOn && (now - buzzerStartTime >= buzzerDuration)) {
-    // digitalWrite(BUZZER_PIN, LOW);
-    buzzerOn = false;
-    Serial.println("🔕 بازر خاموش شد خودکار");
-  }
+    // Wait until next cycle
+    vTaskDelayUntil(&lastWakeTime, pdMS_TO_TICKS(ultrasonicInterval));
+  }a
+}
 
-  // --- خواندن سنسورها هر 5 ثانیه ---
-  if (now - lastSensorCheck > 5000) {
-    lastSensorCheck = now;
 
-    // --- شعله ---
+// Sensors task: runs every sensorInterval and reads flame, smoke, DHT, LDR
+void TaskSensors(void* pvParameters) {
+  (void)pvParameters;
+
+  TickType_t lastWakeTime = xTaskGetTickCount();
+
+  while (1) {
+    unsigned long now = millis();
+    char buf[256];
+
+    // --- Flame detection ---
     bool flame = (digitalRead(IR_FLAME_PIN) == LOW);
-
     if (flame) {
-      Serial.println("🔥 شعله تشخیص داده شد!");
-      analogWrite(R, 255);
-      analogWrite(G, 19);
-      analogWrite(B, 0);
+      logMessage("🔥 شعله تشخیص داده شد!");
+      alarmState = FLAME;  // Flame has highest priority
+    } else if (alarmState == FLAME) {
+      alarmState = IDLE;
     }
 
-    // --- دود ---
+    // --- Gas / Smoke detection ---
     int smokeVal = analogRead(SMOKE_AO_PIN);
-    Serial.print("🌫️ دود: ");
-    Serial.println(smokeVal);
+
+    sprintf(buf, "🌫️ دود: %d", smokeVal);
+    logMessage(buf);
+
     if (smokeVal > 300) {
-      Serial.println("⚠️ دود زیاد!");
-      analogWrite(R, 255);
-      analogWrite(G, 0);
-      analogWrite(B, 22);
-    } else if (!flame) {
-      analogWrite(R, 255);
-      analogWrite(G, 255);
-      analogWrite(B, 255);
+      logMessage("⚠️ دود زیاد!");
+      if (alarmState != FLAME) {
+        alarmState = SMOKE_HIGH;
+      }  // Medium priority
+    } else if (alarmState == SMOKE_HIGH) {
+      alarmState = IDLE;
     }
 
-    // --- دما و رطوبت محیط ---
+    // --- Temperature & Humidity ---
     float temp = dht.readTemperature();
     float hum = dht.readHumidity();
-
     if (!isnan(temp) && !isnan(hum)) {
-      Serial.print("🌡️ دما: ");
-      Serial.print(temp);
-      Serial.print(" °C | 💧 رطوبت: ");
-      Serial.print(hum);
-      Serial.println(" %");
+      sprintf(buf, "🌡️ دما: 1.&f °C | 💧 رطوبت: 1.%f %%", temp, hum);
+      logMessage(buf);
     } else {
-      Serial.println("⚠️ خطا در خواندن DHT");
+      logMessage("⚠️ خطا در خواندن DHT");
     }
 
-    // --- LDR ---
+    // --- LDR / Light detection ---
     int ldrStatus = digitalRead(LDR_DO_PIN);
     if (ldrStatus == LOW) {
-      Serial.println("🌙 تاریکی → LED خاموش");
+      logMessage("🌙 تاریکی → LED خاموش");
     } else {
-      Serial.println("☀️ نور کافی → LED روشن");
+      logMessage("☀️ نور کافی → LED روشن");
+    }
+
+    // Wait until next sensor check
+    vTaskDelayUntil(&lastWakeTime, pdMS_TO_TICKS(sensorInterval));
+  }
+}
+
+void TaskMotion(void* pvParameters) {
+  (void)pvParameters;
+
+  TickType_t lastWakeTime = xTaskGetTickCount();
+
+  while (1) {
+    unsigned long now = millis();
+    bool motionDetected = (digitalRead(MOTION_PIN) == HIGH);
+
+    // Home security motion has the lowest priority
+    if (motionDetected) {
+      if (isArmed) {
+        if (alarmState != FLAME && alarmState != SMOKE_HIGH) {
+          alarmState = MOTION;
+        }
+        logMessage("🚨 حرکت تشخیص داده شد (امنیت خانه)");
+      } else {
+        logMessage("👣 حرکت تشخیص داده شد (دزدگیر خاموش)");
+      }
+    } else if (alarmState == MOTION) {
+      alarmState = IDLE;
+    }
+
+    vTaskDelayUntil(&lastWakeTime, pdMS_TO_TICKS(motionInterval));
+  }
+}
+
+
+// RGB manager: placeholder task
+void TaskRGB(void* pvParameters) {
+  (void)pvParameters;
+  enum MotionLED { RED,
+                   BLUE };
+  static MotionLED motionLED = RED;
+  while (1) {
+    switch (alarmState) {
+      case FLAME:
+        setRGB(255, 45, 0);
+        break;
+      case SMOKE_HIGH:
+        setRGB(255, 0, 45);
+        break;
+      case MOTION:
+        {
+          if (motionLED == RED) {
+            setRGB(0, 0, 255);
+          } else {
+            setRGB(255, 0, 0);
+          }
+        }
+        break;
+      case IDLE:
+        setRGB(255, 255, 255);
+        break;
+      default:
+        logMessage("Invalid Error State!!!!");
+        break;
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+  }
+}
+
+void TaskDebug(void* pvParameters) {
+  char msg[64];
+
+  while (1) {
+    // Wait indefinitely until a message arrives
+    if (xQueueReceive(debugQueue, &msg, portMAX_DELAY) == pdPASS) {
+      Serial.println(msg);
     }
   }
 }
+
+// -------------------------
+// Function Declrations
+// -------------------------
+void setServoAngle(int angle) {
+  // Clamp to safe range
+  angle = constrain(angle, 0, 180);
+
+  // Map angle (0–180) to pulse (1000–2000 µs)
+  int pulse = map(angle, 0, 180, 1000, 2000);
+
+  // Update global pulse width
+  servoPulseUs = pulse;
+}
+void logMessage(const char* msg) {
+  // Non-blocking send to queue
+  xQueueSend(debugQueue, msg, 0);
+}
+void setRGB(uint8_t r, uint8_t g, uint8_t b) {
+  ledcWrite(R_CH, r);
+  ledcWrite(G_CH, g);
+  ledcWrite(B_CH, b);
+}
+// -------------------------.
