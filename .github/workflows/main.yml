@@ -27,14 +27,17 @@ jobs:
       # 3️⃣ Install the board core (change if not using Arduino Uno)
       - name: Install Arduino core
         run: arduino-cli core install arduino:avr
-
+      - name: Install ESP32 core
+        run: arduino-cli core update-index
+      - run: arduino-cli core install esp32:esp32
+      
       # 4️⃣ Compile the sketch
       - name: Compile Sketch
-        run: arduino-cli compile --fqbn arduino:avr:uno ./YourSketchFolder
+        run: arduino-cli compile --fqbn esp32:esp32:esp32dev ./Smarthome
 
       # 5️⃣ Optional: Upload hex as artifact
       - name: Upload .hex artifact
         uses: actions/upload-artifact@v4.6.2
         with:
           name: firmware
-          path: ./YourSketchFolder/build/arduino.avr.uno/YourSketchFolder.ino.hex
+          path: ./build/arduino.avr.uno/YourSketchFolder.ino.hex
