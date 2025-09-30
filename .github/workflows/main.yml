@@ -1,0 +1,43 @@
+name: Arduino CI
+
+# Trigger on push or pull request to main
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1️⃣ Check out the repository
+      - uses: actions/checkout@v3
+
+      # 2️⃣ Install Arduino CLI
+      - name: Install Arduino CLI
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
+          echo "$PWD/bin" >> $GITHUB_PATH
+
+      - name: Verify Arduino CLI
+        run: arduino-cli version
+    
+      # 3️⃣ Install the board core (change if not using Arduino Uno)
+      - name: Install Arduino core
+        run: arduino-cli core install arduino:avr
+      - name: Install ESP32 core
+        run: arduino-cli core update-index
+      - run: arduino-cli core install esp32:esp32
+      
+      # 4️⃣ Compile the sketch
+      - name: Compile Sketch
+        run: arduino-cli compile --fqbn esp32:esp32:esp32dev .
+
+      # 5️⃣ Optional: Upload hex as artifact
+      - name: Upload .hex artifact
+        uses: actions/upload-artifact@v4.6.2
+        with:
+          name: firmware
+          path: ./build/arduino.avr.uno/YourSketchFolder.ino.hex
