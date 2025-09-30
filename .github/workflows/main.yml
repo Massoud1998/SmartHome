@@ -19,8 +19,9 @@ jobs:
       - name: Install Arduino CLI
         run: |
           curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | sh
-          arduino-cli core update-index
-
+          echo "$PWD/bin" >> $GITHUB_PATH
+          arduino-cli version
+    
       # 3️⃣ Install the board core (change if not using Arduino Uno)
       - name: Install Arduino core
         run: arduino-cli core install arduino:avr
