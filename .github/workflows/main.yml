@@ -33,7 +33,7 @@ jobs:
       
       # 4️⃣ Compile the sketch
       - name: Compile Sketch
-        run: arduino-cli compile --fqbn esp32:esp32:esp32dev ./SmartHome.ino
+        run: arduino-cli compile --fqbn esp32:esp32:esp32dev .
 
       # 5️⃣ Optional: Upload hex as artifact
       - name: Upload .hex artifact
