@@ -44,6 +44,7 @@ volatile DoorState doorState = CLOSED;
 volatile unsigned long autoCloseDelay = 3000;
 
 
+
 enum AlarmState {
   IDLE,       // No alarm triggered
   MOTION,     // Motion detected
